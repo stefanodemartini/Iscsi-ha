@@ -1,0 +1,1037 @@
+#! /bin/sh
+
+#
+#   Resource Agent for managing the Generic SCSI Target Subsystem
+#   for Linux (SCST) and related daemons.
+#
+
+# Initialization
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+SCST_MODS="scst iscsi_scst isert_scst ib_srpt \
+scst_disk scst_vdisk scst_tape scst_changer fcst"
+SCST_CFG="/etc/scst.conf"
+PRE_SCST_CONF="/etc/pre-scst_xtra_conf"
+POST_SCST_CONF="/etc/post-scst_xtra_conf"
+SCST_SYSFS="/sys/kernel/scst_tgt"
+ALUA_STATES="active nonoptimized standby unavailable offline transitioning"
+TRANSITION_STATE="transitioning"
+DLM_CONTROLD_PID="/var/run/dlm_controld/dlm_controld.pid"
+INIT_LOGOUT_TIMEOUT=20
+
+# Which Cavium/QLogic target module
+if [ -f "/lib/modules/$(/bin/uname -r)/extra/qla2x00tgt.ko" ]; then
+    SCST_MODS="${SCST_MODS} qla2x00tgt"
+else
+    SCST_MODS="${SCST_MODS} scst_qla2xxx"
+fi
+
+# For optional SCST modules
+OPTL_MODS=""
+if [ -f "/lib/modules/$(uname -r)/extra/atto_scst.ko" ]; then
+    OPTL_MODS="${OPTL_MODS} atto_scst"
+fi
+if [ -f "/lib/modules/$(uname -r)/extra/ocs_fc_scst.ko" ]; then
+    OPTL_MODS="${OPTL_MODS} ocs_fc_scst"
+fi
+if [ -f "/lib/modules/$(uname -r)/extra/chfcoe.ko" ]; then
+    OPTL_MODS="${OPTL_MODS} chfcoe"
+fi
+
+
+scst_start() {
+    # Exit immediately if configuration is not valid
+    scst_validate_all || exit ${?}
+
+    # If resource is already running, bail out early
+    if scst_monitor; then
+        ocf_log info "Resource is already running."
+        return ${OCF_SUCCESS}
+    fi
+
+    # If our pre-SCST file exists, run it
+    if [ -f "${PRE_SCST_CONF}" ]; then
+        ocf_log info "Pre-SCST user config. file found; running..."
+        ocf_run -warn sh "${PRE_SCST_CONF}"
+    fi
+
+    # Load SCST modules
+    load_scst_modules
+
+    # Start SCST daemons
+    start_scst_daemons
+
+    # Configure SCST
+    if [ -f "${SCST_CFG}" ]; then
+        if ocf_is_true ${OCF_RESKEY_redirect_mode}; then
+            ocf_log debug "Redirect mode is enabled, adjusting the SCST" \
+                "configuration file..."
+            cp -f ${SCST_CFG} ${SCST_CFG}.redirect_mode_backup
+            sed -i '/^\t\tactive /d' ${SCST_CFG}
+            sed -i '/^\t\tcluster_mode /d' ${SCST_CFG}
+            sed -i '/^\t\tstate /d' ${SCST_CFG}
+            alua_start="${TRANSITION_STATE}"
+            cat ${SCST_CFG} | perl -n -s \
+                -e '$in_handler = 1 if (/^HANDLER vdisk_blockio/);' \
+                -e '$in_dev = 1 if (/^\tDEVICE /);' \
+                -e 'if ($in_handler && $in_dev && /^\t}/) {' \
+                -e 'print "\t\tactive 0\n"; $in_dev=0; };' \
+                -e '$in_handler = 0 if (/^}/);' \
+                -e '$in_dev_grp = 1 if (/^DEVICE_GROUP /);' \
+                -e '$in_tgt_grp = 1 if (/^\tTARGET_GROUP /);' \
+                -e 'if ($in_dev_grp && $in_tgt_grp && /^\t}/) {' \
+                -e 'print "\t\tstate $alua_start\n"; $in_tgt_grp=0; } print;' \
+                -e '$in_dev_grp = 0 if (/^}/);' -- -alua_start=${alua_start} \
+                > /tmp/scst.conf
+            mv -f /tmp/scst.conf ${SCST_CFG}
+        fi
+        ocf_log info "Applying SCST configuration..."
+        if ocf_is_true ${OCF_RESKEY_issue_lip}; then
+            ocf_run scstadmin -config "${SCST_CFG}" -lip
+        else
+            ocf_run scstadmin -config "${SCST_CFG}"
+        fi
+        if [ ${?} -ne 0 ]; then
+            error_msg="Something is wrong with the SCST configuration!"
+            ocf_exit_reason "${error_msg}"
+            stop_scst_daemons
+            unload_scst_modules
+            exit ${OCF_ERR_GENERIC}
+        fi
+    fi
+
+    if kill -s 0 $(cat ${DLM_CONTROLD_PID}) > /dev/null 2>&1; then
+        # Enable cluster mode for all SCST devices
+        ocf_log info "Enabling cluster mode for all devices..."
+        for i in $(find ${SCST_SYSFS}/devices -name cluster_mode -type f); do
+            echo 1 > ${i} &
+        done
+        ocf_log debug "Waiting for enable-cluster-mode to complete..."
+        wait
+    else
+        ocf_log info "It appears dlm_controld is not running, skipping" \
+            "enable-cluster-mode..."
+    fi
+
+    # Now the targets can be enabled (we assume they were disabled)
+    ocf_log info "Enabling all target interfaces..."
+    for i in $(find ${SCST_SYSFS}/targets/ -name enabled); do
+        echo 1 > ${i} &
+    done
+    ocf_log debug "Waiting for enable-targets to complete..."
+    wait
+
+    # If our post-SCST file exists, run it
+    if [ -f "${POST_SCST_CONF}" ]; then
+        ocf_log info "Post-SCST user config. file found; running..."
+        ocf_run -warn sh "${POST_SCST_CONF}"
+    fi
+
+    # If we are using ALUA, be sure we are using the "Slave" state initially
+    if ocf_is_true ${OCF_RESKEY_alua}; then
+        check_alua
+        # Set the local target group ALUA state
+        ocf_log debug "scst_start() -> Setting target group" \
+            "'${OCF_RESKEY_local_tgt_grp}' ALUA state to" \
+            "'${OCF_RESKEY_s_alua_state}'..."
+        ocf_run scstadmin -noprompt -set_tgrp_attr \
+            ${OCF_RESKEY_local_tgt_grp} -dev_group \
+            ${OCF_RESKEY_device_group} -attributes \
+            state\=${OCF_RESKEY_s_alua_state}
+        if [ ${?} -ne 0 ]; then
+            error_msg="Failed to set the local target group state!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_GENERIC}
+        fi
+        # For now, we simply assume the other node is the Master
+        ocf_log debug "scst_start() -> Setting target group" \
+            "'${OCF_RESKEY_remote_tgt_grp}' ALUA state to" \
+            "'${OCF_RESKEY_m_alua_state}'..."
+        ocf_run scstadmin -noprompt -set_tgrp_attr \
+            ${OCF_RESKEY_remote_tgt_grp} -dev_group \
+            ${OCF_RESKEY_device_group} -attributes \
+            state\=${OCF_RESKEY_m_alua_state}
+        if [ ${?} -ne 0 ]; then
+            error_msg="Failed to set the remote target group state!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_GENERIC}
+        fi
+    fi
+
+    # Make sure the resource started correctly
+    while ! scst_monitor; do
+        ocf_log debug "scst_start() -> Resource has not started yet, waiting..."
+        sleep 1
+    done
+
+    if ocf_is_true ${OCF_RESKEY_issue_lip}; then
+        # Issue a delayed Fibre Channel LIP
+        ocf_log debug "Issuing a LIP for all drivers and targets..."
+        ocf_run sleep 5 && scstadmin -issue_lip
+    fi
+
+    # Only return $OCF_SUCCESS if _everything_ succeeded as expected
+    return ${OCF_SUCCESS}
+}
+
+
+scst_stop() {
+    # Exit immediately if configuration is not valid
+    scst_validate_all || exit ${?}
+
+    # Check the current resource state
+    scst_monitor
+    local rc=${?}
+    case "${rc}" in
+    "${OCF_SUCCESS}")
+        # Currently running; normal, expected behavior
+        ocf_log info "Resource is currently running."
+        ;;
+    "${OCF_RUNNING_MASTER}")
+        # Running as a Master; need to demote before stopping
+        ocf_log info "Resource is currently running as Master."
+        scst_demote || ocf_log warn "Demote failed, trying to stop anyway..."
+        ;;
+    "${OCF_NOT_RUNNING}")
+        # Currently not running; nothing to do
+        ocf_log info "Resource is already stopped."
+        return ${OCF_SUCCESS}
+        ;;
+    esac
+
+    # Demote to offline only makes sense if we are using ALUA
+    if ocf_is_true ${OCF_RESKEY_alua}; then
+        check_alua
+        # Set the local target group to the offline/unavailable ALUA state
+        ocf_log debug "scst_stop() -> Setting target group" \
+            "'${OCF_RESKEY_local_tgt_grp}' ALUA state to" \
+            "'${OCF_RESKEY_remote_inact_state}'..."
+        ocf_run scstadmin -noprompt -set_tgrp_attr \
+            ${OCF_RESKEY_local_tgt_grp} -dev_group \
+            ${OCF_RESKEY_device_group} -attributes \
+            state\=${OCF_RESKEY_remote_inact_state}
+        if [ ${?} -ne 0 ]; then
+            error_msg="Failed to set the local target group to offline!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_GENERIC}
+        fi
+    fi
+
+    # First we need to disable all target interfaces
+    ocf_log info "Disabling all target interfaces..."
+    for i in $(find ${SCST_SYSFS}/targets/ -name enabled); do
+        echo 0 > ${i} &
+    done
+    ocf_log debug "Waiting for disable-targets to complete..."
+    wait
+
+    # Disabling an iSCSI target interface does not close sessions
+    ocf_log info "Closing any iSCSI sessions..."
+    for i in $(find ${SCST_SYSFS}/targets/iscsi/ -name force_close); do
+        echo 1 > ${i}
+    done
+
+    # We need to wait for all sessions to complete before continuing
+    timer=0
+    ocf_log info "Waiting for all initiators to logout..."
+    while ls -Ad ${SCST_SYSFS}/targets/*/*/sessions/* 2>&1 |
+        grep -vE "${SCST_SYSFS}"'/targets/(copy_manager|scst_local)/'; do
+        if [ ${timer} -gt ${INIT_LOGOUT_TIMEOUT} ]; then
+            # Some initiators don't logout properly, don't wait forever
+            ocf_log warn "The initiator logout timeout" \
+                "(${INIT_LOGOUT_TIMEOUT}) was hit! Continuing..."
+            break
+        fi
+        timer=$(expr ${timer} + 1)
+        ocf_log debug "Still waiting..."
+        sleep 1
+    done
+
+    if kill -s 0 $(cat ${DLM_CONTROLD_PID}) > /dev/null 2>&1; then
+        # Finally we can release DLM lockspaces (disable cluster mode)
+        ocf_log info "Disabling cluster mode for all devices..."
+        while grep -q '^1$' ${SCST_SYSFS}/devices/*/cluster_mode \
+            2> /dev/null; do
+            for i in ${SCST_SYSFS}/devices/*/cluster_mode; do
+                { [ -e "${i}" ] && echo 0 > "${i}"; } &
+            done
+            ocf_log debug "Waiting for disable-cluster-mode to complete..."
+            wait
+            sleep 1
+        done
+    else
+        ocf_log info "It appears dlm_controld is not running, skipping" \
+            "disable-cluster-mode..."
+    fi
+
+    # Stop SCST daemons
+    stop_scst_daemons
+
+    # Unload SCST modules
+    unload_scst_modules
+
+    # Make sure the resource stopped correctly
+    while scst_monitor; do
+        ocf_log debug "scst_stop() -> Resource has not stopped yet, waiting..."
+        sleep 1
+    done
+
+    # Only return $OCF_SUCCESS if _everything_ succeeded as expected
+    return ${OCF_SUCCESS}
+}
+
+
+scst_monitor() {
+    # Exit immediately if configuration is not valid
+    scst_validate_all || exit ${?}
+
+    # Check if SCST is loaded
+    local rc
+    if [ -e "${SCST_SYSFS}/version" ]; then
+        ocf_log debug "scst_monitor() -> SCST version:" \
+            "$(cat ${SCST_SYSFS}/version)"
+        ocf_log debug "scst_monitor() -> Resource is running."
+        crm_master -l reboot -v 100
+        rc=${OCF_SUCCESS}
+    else
+        ocf_log debug "scst_monitor() -> Resource is not running."
+        crm_master -l reboot -D
+        rc=${OCF_NOT_RUNNING}
+        return ${rc}
+    fi
+
+    # If we are using ALUA, then we can test if we are Master or not
+    if ocf_is_true ${OCF_RESKEY_alua}; then
+        dev_grp_path="${SCST_SYSFS}/device_groups/${OCF_RESKEY_device_group}"
+        l_tgt_grp_path="${dev_grp_path}/target_groups/${OCF_RESKEY_local_tgt_grp}"
+        l_tgt_grp_state="$(head -1 ${l_tgt_grp_path}/state)"
+        r_tgt_grp_path="${dev_grp_path}/target_groups/${OCF_RESKEY_remote_tgt_grp}"
+        r_tgt_grp_state="$(head -1 ${r_tgt_grp_path}/state)"
+        ocf_log debug "scst_monitor() -> SCST local target" \
+            "group state: ${l_tgt_grp_state}"
+        if [ "x${l_tgt_grp_state}" = "x${OCF_RESKEY_m_alua_state}" ]; then
+            rc=${OCF_RUNNING_MASTER}
+        fi
+
+        # We handle detecting if the remote node is offline/unavailable here
+        if remote_inactive; then
+            # Remote does not exist, so set the remote target group to offline
+            if [ "x${r_tgt_grp_state}" != \
+                "x${OCF_RESKEY_remote_inact_state}" ]; then
+                ocf_log debug "scst_monitor() -> Setting target group" \
+                    "'${OCF_RESKEY_remote_tgt_grp}' ALUA state to" \
+                    "'${OCF_RESKEY_remote_inact_state}'..."
+                ocf_run scstadmin -noprompt -set_tgrp_attr \
+                    ${OCF_RESKEY_remote_tgt_grp} -dev_group \
+                    ${OCF_RESKEY_device_group} -attributes \
+                    state\=${OCF_RESKEY_remote_inact_state}
+                if [ ${?} -ne 0 ]; then
+                    error_msg="Failed to set the remote target group to offline!"
+                     ocf_exit_reason "${error_msg}"
+                    exit ${OCF_ERR_GENERIC}
+                fi
+            fi
+        else
+            if [ "x${l_tgt_grp_state}" = "x${OCF_RESKEY_m_alua_state}" ]; then
+                # Remote exists and we're Master, so set the remote to Slave
+                if [ "x${r_tgt_grp_state}" != \
+                    "x${OCF_RESKEY_s_alua_state}" ]; then
+                    ocf_log debug "scst_monitor() -> Setting target group" \
+                        "'${OCF_RESKEY_remote_tgt_grp}' ALUA state to" \
+                        "'${OCF_RESKEY_s_alua_state}'..."
+                    ocf_run scstadmin -noprompt -set_tgrp_attr \
+                        ${OCF_RESKEY_remote_tgt_grp} -dev_group \
+                        ${OCF_RESKEY_device_group} -attributes \
+                        state\=${OCF_RESKEY_s_alua_state}
+                    if [ ${?} -ne 0 ]; then
+                        error_msg="Failed to set the remote target group state!"
+                        ocf_exit_reason "${error_msg}"
+                        exit ${OCF_ERR_GENERIC}
+                    fi
+                fi
+            else
+                # Remote exists and we're Slave, so set the remote to Master
+                if [ "x${r_tgt_grp_state}" != \
+                    "x${OCF_RESKEY_m_alua_state}" ]; then
+                    ocf_log debug "scst_monitor() -> Setting target group" \
+                        "'${OCF_RESKEY_remote_tgt_grp}' ALUA state to" \
+                        "'${OCF_RESKEY_m_alua_state}'..."
+                    ocf_run scstadmin -noprompt -set_tgrp_attr \
+                        ${OCF_RESKEY_remote_tgt_grp} -dev_group \
+                        ${OCF_RESKEY_device_group} -attributes \
+                        state\=${OCF_RESKEY_m_alua_state}
+                    if [ ${?} -ne 0 ]; then
+                        error_msg="Failed to set the remote target group state!"
+                        ocf_exit_reason "${error_msg}"
+                        exit ${OCF_ERR_GENERIC}
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    return ${rc}
+}
+
+
+scst_validate_all() {
+    # Test for required binaries
+    check_binary scstadmin
+
+    # There can only be one instance of SCST running per node
+    if [ ! -z "${OCF_RESKEY_CRM_meta_clone_node_max}" ] &&
+        [ "${OCF_RESKEY_CRM_meta_clone_node_max}" -ne 1 ]; then
+        error_msg="The 'clone-node-max' parameter must equal '1'."
+        ocf_exit_reason "${error_msg}"
+        exit ${OCF_ERR_CONFIGURED}
+    fi
+
+    # If ALUA support is enabled, we need to check the parameters
+    if ocf_is_true ${OCF_RESKEY_alua}; then
+        # Make sure they are set to something
+        if [ -z "${OCF_RESKEY_device_group}" ]; then
+            error_msg="The 'device_group' parameter is not set!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_CONFIGURED}
+        fi
+        if [ -z "${OCF_RESKEY_local_tgt_grp}" ]; then
+            error_msg="The 'local_tgt_grp' parameter is not set!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_CONFIGURED}
+        fi
+        if [ -z "${OCF_RESKEY_remote_tgt_grp}" ]; then
+            error_msg="The 'remote_tgt_grp' parameter is not set!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_CONFIGURED}
+        fi
+        if [ -z "${OCF_RESKEY_m_alua_state}" ]; then
+            error_msg="The 'm_alua_state' parameter is not set!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_CONFIGURED}
+        fi
+        if [ -z "${OCF_RESKEY_s_alua_state}" ]; then
+            error_msg="The 's_alua_state' parameter is not set!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_CONFIGURED}
+        fi
+        #  Currently, we only support using one Master with this RA
+        if [ ! -z "${OCF_RESKEY_CRM_meta_master_max}" ] &&
+            [ "${OCF_RESKEY_CRM_meta_master_max}" -ne 1 ]; then
+            error_msg="The 'master-max' parameter must equal '1'."
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_CONFIGURED}
+        fi
+        if [ ! -z "${OCF_RESKEY_CRM_meta_master_node_max}" ] &&
+            [ "${OCF_RESKEY_CRM_meta_master_node_max}" -ne 1 ]; then
+            error_msg="The 'master-node-max' parameter must equal '1'."
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_CONFIGURED}
+        fi
+    fi
+
+    return ${OCF_SUCCESS}
+}
+
+
+scst_meta_data() {
+	cat <<-EOF
+	<?xml version="1.0"?>
+	<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+	<resource-agent name="scst" version="0.1">
+	  <version>0.1</version>
+	  <longdesc lang="en">The SCST OCF resource agent; includes SCST ALUA support.</longdesc>
+	  <shortdesc lang="en">SCST OCF RA script.</shortdesc>
+	  <parameters>
+	    <parameter name="alua" unique="0" required="0">
+	      <longdesc lang="en">Use to enable/disable updating ALUA status in SCST.</longdesc>
+	      <shortdesc lang="en">The 'alua' parameter.</shortdesc>
+	      <content type="boolean" default="false" />
+	    </parameter>
+	    <parameter name="device_group" unique="0" required="0">
+	      <longdesc lang="en">The name of the SCST device group (used with ALUA support).</longdesc>
+	      <shortdesc lang="en">The 'device_group' parameter.</shortdesc>
+	      <content type="string" default="" />
+	    </parameter>
+	    <parameter name="local_tgt_grp" unique="0" required="0">
+	      <longdesc lang="en">The name of the SCST local target group (used with ALUA support).</longdesc>
+	      <shortdesc lang="en">The 'local_tgt_grp' parameter.</shortdesc>
+	      <content type="string" default="" />
+	    </parameter>
+	    <parameter name="remote_tgt_grp" unique="0" required="0">
+	      <longdesc lang="en">The name of the SCST remote target group (used with ALUA support).</longdesc>
+	      <shortdesc lang="en">The 'remote_tgt_grp' parameter.</shortdesc>
+	      <content type="string" default="" />
+	    </parameter>
+	    <parameter name="m_alua_state" unique="0" required="0">
+	      <longdesc lang="en">The ALUA state (eg, active) for a Master node (used with ALUA support).</longdesc>
+	      <shortdesc lang="en">The 'm_alua_state' parameter.</shortdesc>
+	      <content type="string" default="active" />
+	    </parameter>
+	    <parameter name="s_alua_state" unique="0" required="0">
+	      <longdesc lang="en">The ALUA state (eg, nonoptimized) for a Slave node (used with ALUA support).</longdesc>
+	      <shortdesc lang="en">The 's_alua_state' parameter.</shortdesc>
+	      <content type="string" default="nonoptimized" />
+	    </parameter>
+	    <parameter name="use_trans_state" unique="0" required="0">
+	      <longdesc lang="en">Use the "transitioning" ALUA state before changing target group states.</longdesc>
+	      <shortdesc lang="en">The 'use_trans_state' parameter.</shortdesc>
+	      <content type="boolean" default="false" />
+	    </parameter>
+	    <parameter name="set_dev_active" unique="0" required="0">
+	      <longdesc lang="en">Set any vdisk_blockio devices for the given device group to active/inactive (1/0) on promotion/demotion.</longdesc>
+	      <shortdesc lang="en">The 'set_dev_active' parameter.</shortdesc>
+	      <content type="boolean" default="false" />
+	    </parameter>
+	    <parameter name="redirect_mode" unique="0" required="0">
+	      <longdesc lang="en">Set the "active" attribute to 0 for all devices on start-up.</longdesc>
+	      <shortdesc lang="en">The 'redirect_mode' parameter.</shortdesc>
+	      <content type="boolean" default="false" />
+	    </parameter>
+	    <parameter name="issue_lip" unique="0" required="0">
+	      <longdesc lang="en">Issue Fibre Channel LIP requests during key operations (may improve initiator responsiveness during fail-over or fail-back).</longdesc>
+	      <shortdesc lang="en">The 'issue_lip' parameter.</shortdesc>
+	      <content type="boolean" default="false" />
+	    </parameter>
+	    <parameter name="remote_inact_state" unique="0" required="0">
+	      <longdesc lang="en">The ALUA state for an inactive / offline node (used with ALUA support).</longdesc>
+	      <shortdesc lang="en">The 'remote_inact_state' parameter.</shortdesc>
+	      <content type="string" default="offline" />
+	    </parameter>
+	  </parameters>
+	  <actions>
+	    <action name="meta-data" timeout="5" />
+	    <action name="start" timeout="120" />
+	    <action name="stop" timeout="90" />
+	    <action name="monitor" timeout="20" depth="0" interval="10" role="Master" />
+	    <action name="monitor" timeout="20" depth="0" interval="20" role="Slave" />
+	    <action name="monitor" timeout="20" depth="0" interval="30" />
+	    <action name="notify" timeout="20" />
+	    <action name="promote" timeout="60" />
+	    <action name="demote" timeout="60" />
+	    <action name="reload" timeout="20" />
+	    <action name="validate-all" timeout="20" />
+	  </actions>
+	</resource-agent>
+	EOF
+}
+
+
+scst_usage() {
+    echo "usage: ${0} {start|stop|monitor|validate-all|promote|demote|reload|notify|meta-data}"
+    echo ""
+    echo "Expects to have a fully populated OCF RA-compliant environment set."
+}
+
+
+load_scst_modules() {
+    # Load all modules
+    ocf_log info "Loading kernel modules..."
+    # The core SCST modules first
+    for i in ${SCST_MODS}; do
+        ocf_log debug "scst_start() -> Module: ${i}"
+        if [ -d /sys/module/${i} ]; then
+            ocf_log warn "The ${i} module is already loaded!"
+        else
+            ocf_run modprobe ${i}
+            rc=${?}
+            if [ ${rc} -ne 0 ]; then
+                error_msg="Failed to load module '${i}'!"
+                ocf_exit_reason "${error_msg}"
+                exit ${OCF_ERR_GENERIC}
+            fi
+        fi
+    done
+    # The optional driver modules next (don't check exit status)
+    for i in ${OPTL_MODS}; do
+        ocf_log debug "scst_start() -> Module: ${i}"
+        if [ -d /sys/module/${i} ]; then
+            ocf_log warn "The ${i} module is already loaded!"
+        else
+            ocf_run modprobe -s ${i}
+        fi
+    done
+}
+
+
+unload_scst_modules() {
+    # Unload the modules (in reverse)
+    ocf_log info "Unloading kernel modules..."
+    # The optional driver modules first (don't check exit status)
+    for i in $(echo ${OPTL_MODS} | tr ' ' '\n' | tac | tr '\n' ' '); do
+        ocf_log debug "scst_stop() -> Module: ${i}"
+        if [ -d /sys/module/${i} ]; then
+            ocf_run rmmod ${i}
+        else
+            ocf_log warn "The ${i} module is not loaded!"
+        fi
+    done
+    # The core SCST modules next
+    for i in $(echo ${SCST_MODS} | tr ' ' '\n' | tac | tr '\n' ' '); do
+        ocf_log debug "scst_stop() -> Module: ${i}"
+        if [ -d /sys/module/${i} ]; then
+            ocf_run rmmod ${i}
+            rc=${?}
+            if [ ${rc} -ne 0 ]; then
+                error_msg="Failed to unload module '${i}'!"
+                ocf_exit_reason "${error_msg}"
+                exit ${OCF_ERR_GENERIC}
+            fi
+        else
+            ocf_log warn "The ${i} module is not loaded!"
+        fi
+    done
+}
+
+
+start_scst_daemons() {
+    # Start the daemons
+    ocf_log info "Starting daemons..."
+    if pidof iscsi-scstd > /dev/null 2>&1; then
+        ocf_log warn "The iscsi-scstd daemon is already running!"
+    else
+        ocf_run iscsi-scstd
+        rc=${?}
+        if [ ${rc} -ne 0 ]; then
+            error_msg="Failed to start iscsi-scstd!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_GENERIC}
+        fi
+    fi
+ }
+
+
+stop_scst_daemons() {
+    # Stop all of the daemons and wait for each
+    ocf_log info "Stopping daemons..."
+   for i in "iscsi-scstd"; do 
+  #for i in "fcoemon iscsi-scstd"; do
+        pidof ${i} > /dev/null 2>&1
+        if [ ${?} -ne 0 ]; then
+            ocf_log warn "The '${i}' daemon is not running!"
+            continue
+        fi
+        ocf_log debug "scst_stop() -> Sending the TERM signal to '${i}'..."
+        ocf_run killall -TERM ${i}
+        rc=${?}
+        if [ ${rc} -ne 0 ]; then
+            error_msg="Failed to stop the '${i}' daemon!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_GENERIC}
+        fi
+        sleep 1
+        while pidof ${i} > /dev/null 2>&1; do
+            ocf_log debug "scst_stop() -> The '${i}' daemon is" \
+                "still running, waiting..."
+            sleep 1
+        done
+    done
+}
+
+
+remote_inactive() {
+    # Determine if there is an inactive (stopped) instance
+    crm_mon --as-xml | \
+        grep "resource.*id=\"${OCF_RESOURCE_INSTANCE}\".*active=\"false\"" \
+        > /dev/null 2>&1
+    return ${?}
+}
+
+
+block_scst_devs() {
+    # Block all devices that are members of our device group
+    ocf_log info "Blocking all '${OCF_RESKEY_device_group}' devices..."
+    dev_grp_path="${SCST_SYSFS}/device_groups/${OCF_RESKEY_device_group}"
+    for i in $(find ${dev_grp_path}/devices -type l -maxdepth 1); do
+        echo 1 > ${i}/block &
+    done
+    ocf_log debug "Waiting for devices to finish blocking..."
+    wait
+}
+
+
+unblock_scst_devs() {
+    # Unblock all devices that are members of our device group
+    ocf_log info "Unblocking all '${OCF_RESKEY_device_group}' devices..."
+    dev_grp_path="${SCST_SYSFS}/device_groups/${OCF_RESKEY_device_group}"
+    for i in $(find ${dev_grp_path}/devices -type l -maxdepth 1); do
+        echo 0 > ${i}/block
+    done
+}
+
+
+trigger_suspend_resume() {
+    # For just one member device of our device group, write to a benign
+    # attribute (eg, size) which causes I/O to suspend and then resume
+    ocf_log info "Suspending and resuming I/O globally..."
+    dev_grp_path="${SCST_SYSFS}/device_groups/${OCF_RESKEY_device_group}"
+    for i in $(find ${dev_grp_path}/devices -type l -maxdepth 1); do
+        ocf_log debug "Rewriting size attribute value for device '${i}'..."
+        head -1 ${i}/size > ${i}/size
+        break
+    done
+}
+
+
+scst_promote() {
+    # Exit immediately if configuration is not valid
+    scst_validate_all || exit ${?}
+
+    # Test the resource's current state
+    scst_monitor
+    local rc=${?}
+    case "${rc}" in
+    "${OCF_SUCCESS}")
+        # Running as Slave; normal, expected behavior
+        ocf_log debug "scst_promote() -> Resource is" \
+            "currently running as Slave."
+        ;;
+    "${OCF_RUNNING_MASTER}")
+        # Already a Master; unexpected, but not a problem
+        ocf_log info "Resource is already running as Master."
+        return ${OCF_SUCCESS}
+        ;;
+    "${OCF_NOT_RUNNING}")
+        # Currently not running; need to start before promoting
+        ocf_log info "Resource is currently not running."
+        scst_start
+        ;;
+    *)
+        # Failed resource; let the cluster manager recover
+        ocf_log err "Unexpected error, cannot promote."
+        exit ${rc}
+        ;;
+    esac
+
+    # Promote only makes sense if we are using ALUA
+    if ocf_is_true ${OCF_RESKEY_alua}; then
+        # Set the local target group to the "Master" ALUA state
+        check_alua
+        # TODO: Don't block devices for now... needs to be re-visited.
+        #block_scst_devs
+        if ocf_is_true ${OCF_RESKEY_use_trans_state}; then
+            ocf_log debug "scst_promote() -> Setting target group" \
+                "'${OCF_RESKEY_local_tgt_grp}' ALUA state to" \
+                "'${TRANSITION_STATE}'..."
+            ocf_run scstadmin -noprompt -set_tgrp_attr \
+                ${OCF_RESKEY_local_tgt_grp} -dev_group \
+                ${OCF_RESKEY_device_group} -attributes \
+                state\=${TRANSITION_STATE}
+            if [ ${?} -ne 0 ]; then
+                error_msg="Failed to set the local target group state to transitioning!"
+                 ocf_exit_reason "${error_msg}"
+                exit ${OCF_ERR_GENERIC}
+            fi
+            trigger_suspend_resume
+        fi
+        ocf_log debug "scst_promote() -> Setting target group" \
+            "'${OCF_RESKEY_local_tgt_grp}' ALUA state to" \
+            "'${OCF_RESKEY_m_alua_state}'..."
+        ocf_run scstadmin -noprompt -set_tgrp_attr \
+            ${OCF_RESKEY_local_tgt_grp} -dev_group \
+            ${OCF_RESKEY_device_group} -attributes \
+            state\=${OCF_RESKEY_m_alua_state}
+        if [ ${?} -ne 0 ]; then
+            error_msg="Failed to set the local target group state!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_GENERIC}
+        fi
+        if ocf_is_true ${OCF_RESKEY_set_dev_active}; then
+            ocf_log debug "scst_promote() -> Changing the group's devices" \
+                "to active..."
+            devices_path="${SCST_SYSFS}/device_groups/${OCF_RESKEY_device_group}/devices/"
+             for i in $(find ${devices_path} \
+                -name active -type f -follow -maxdepth 2); do
+                echo 1 > ${i}
+            done
+        else
+            trigger_suspend_resume
+        fi
+        # TODO: Don't unblock devices for now... needs to be re-visited.
+        #unblock_scst_devs
+        # Since there can only be one Master, set the remote target group
+        if remote_inactive; then
+            ocf_log debug "scst_promote() -> Setting target group" \
+                "'${OCF_RESKEY_remote_tgt_grp}' ALUA state to" \
+                "'${OCF_RESKEY_remote_inact_state}'..."
+            ocf_run scstadmin -noprompt -set_tgrp_attr \
+                ${OCF_RESKEY_remote_tgt_grp} -dev_group \
+                ${OCF_RESKEY_device_group} -attributes \
+                state\=${OCF_RESKEY_remote_inact_state}
+            if [ ${?} -ne 0 ]; then
+                error_msg="Failed to set the remote target group to offline!"
+                ocf_exit_reason "${error_msg}"
+                exit ${OCF_ERR_GENERIC}
+            fi
+        else
+            ocf_log debug "scst_promote() -> Setting target group" \
+                "'${OCF_RESKEY_remote_tgt_grp}' ALUA state to" \
+                "'${OCF_RESKEY_s_alua_state}'..."
+            ocf_run scstadmin -noprompt -set_tgrp_attr \
+                ${OCF_RESKEY_remote_tgt_grp} -dev_group \
+                ${OCF_RESKEY_device_group} -attributes \
+                state\=${OCF_RESKEY_s_alua_state}
+            if [ ${?} -ne 0 ]; then
+                error_msg="Failed to set the remote target group state!"
+                ocf_exit_reason "${error_msg}"
+                exit ${OCF_ERR_GENERIC}
+            fi
+        fi
+    else
+        error_msg="The ALUA parameters need to be configured before using MS."
+        ocf_exit_reason "${error_msg}"
+        exit ${OCF_ERR_CONFIGURED}
+    fi
+
+    # After the resource has been promoted, check whether the promotion worked
+    while true; do
+        scst_monitor
+        if [ ${?} -eq ${OCF_RUNNING_MASTER} ]; then
+            ocf_log info "Resource was promoted successfully."
+            break
+        else
+            ocf_log debug "scst_promote() -> Resource still" \
+                "awaiting promotion."
+            sleep 1
+        fi
+    done
+
+    if ocf_is_true ${OCF_RESKEY_issue_lip}; then
+        # Issue a delayed Fibre Channel LIP
+        ocf_log debug "Issuing a LIP for all drivers and targets..."
+        ocf_run sleep 5 && scstadmin -issue_lip
+    fi
+
+    # Only return $OCF_SUCCESS if _everything_ succeeded as expected
+    return ${OCF_SUCCESS}
+}
+
+
+scst_demote() {
+    # Exit immediately if configuration is not valid
+    scst_validate_all || exit ${?}
+
+    # Test the resource's current state
+    scst_monitor
+    local rc=${?}
+    case "${rc}" in
+    "${OCF_RUNNING_MASTER}")
+        # Running as Master; normal, expected behavior
+        ocf_log debug "scst_demote() -> Resource is" \
+            "currently running as Master."
+        ;;
+    "${OCF_SUCCESS}")
+        # Already running as Slave; nothing to do
+        ocf_log debug "scst_demote() -> Resource is" \
+            "currently running as Slave."
+        return ${OCF_SUCCESS}
+        ;;
+    "${OCF_NOT_RUNNING}")
+        # Not running; getting a demote action in this state is unexpected
+        error_msg="Resource is currently not running."
+        ocf_exit_reason "${error_msg}"
+        exit ${OCF_ERR_GENERIC}
+        ;;
+    *)
+        # Failed resource; let the cluster manager recover
+        error_msg="Unexpected error, cannot demote."
+        ocf_exit_reason "${error_msg}"
+        exit ${rc}
+        ;;
+    esac
+
+    # Demote only makes sense if we are using ALUA
+    if ocf_is_true ${OCF_RESKEY_alua}; then
+        # Set the local target group to the "Slave" ALUA state
+        check_alua
+        # TODO: Don't block devices for now... needs to be re-visited.
+        #block_scst_devs
+        if ocf_is_true ${OCF_RESKEY_use_trans_state}; then
+            ocf_log debug "scst_demote() -> Setting target group" \
+                "'${OCF_RESKEY_local_tgt_grp}' ALUA state to" \
+                "'${TRANSITION_STATE}'..."
+            ocf_run scstadmin -noprompt -set_tgrp_attr \
+                ${OCF_RESKEY_local_tgt_grp} -dev_group \
+                ${OCF_RESKEY_device_group} -attributes \
+                state\=${TRANSITION_STATE}
+            if [ ${?} -ne 0 ]; then
+                error_msg="Failed to set the local target group state to transitioning!"
+                ocf_exit_reason "${error_msg}"
+                exit ${OCF_ERR_GENERIC}
+            fi
+            trigger_suspend_resume
+        fi
+        ocf_log debug "scst_demote() -> Setting target group" \
+            "'${OCF_RESKEY_local_tgt_grp}' ALUA state to" \
+            "'${OCF_RESKEY_s_alua_state}'..."
+        ocf_run scstadmin -noprompt -set_tgrp_attr \
+            ${OCF_RESKEY_local_tgt_grp} -dev_group \
+            ${OCF_RESKEY_device_group} -attributes \
+            state\=${OCF_RESKEY_s_alua_state}
+        if [ ${?} -ne 0 ]; then
+            error_msg="Failed to set the local target group state!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_GENERIC}
+        fi
+        if ocf_is_true ${OCF_RESKEY_set_dev_active}; then
+            ocf_log debug "scst_demote() -> Changing the group's devices" \
+                "to inactive..."
+            devices_path="${SCST_SYSFS}/device_groups/${OCF_RESKEY_device_group}/devices/"
+             for i in $(find ${devices_path} \
+                -name active -type f -follow -maxdepth 2); do
+                echo 0 > ${i}
+            done
+        else
+            trigger_suspend_resume
+        fi
+        # TODO: Don't unblock devices for now... needs to be re-visited.
+        #unblock_scst_devs
+        # If we're a Slave, we assume the remote side is the Master
+        ocf_log debug "scst_demote() -> Setting target group" \
+            "'${OCF_RESKEY_remote_tgt_grp}' ALUA state to" \
+            "'${OCF_RESKEY_m_alua_state}'..."
+        ocf_run scstadmin -noprompt -set_tgrp_attr \
+            ${OCF_RESKEY_remote_tgt_grp} -dev_group \
+            ${OCF_RESKEY_device_group} -attributes \
+            state\=${OCF_RESKEY_m_alua_state}
+        if [ ${?} -ne 0 ]; then
+            error_msg="Failed to set the remote target group state!"
+            ocf_exit_reason "${error_msg}"
+            exit ${OCF_ERR_GENERIC}
+        fi
+    else
+        ocf_log err "The ALUA parameters need to be configured before using MS."
+        exit ${OCF_ERR_CONFIGURED}
+    fi
+
+    # After the resource has been demoted, check whether the demotion worked
+    while true; do
+        scst_monitor
+        if [ ${?} -eq ${OCF_RUNNING_MASTER} ]; then
+            ocf_log debug "scst_demote() -> Resource still" \
+                "awaiting demotion."
+            sleep 1
+        else
+            ocf_log info "Resource was demoted successfully."
+            break
+        fi
+    done
+
+    if ocf_is_true ${OCF_RESKEY_issue_lip}; then
+        # Issue a delayed Fibre Channel LIP
+        ocf_log debug "Issuing a LIP for all drivers and targets..."
+        ocf_run sleep 5 && scstadmin -issue_lip
+    fi
+
+    # Only return $OCF_SUCCESS if _everything_ succeeded as expected
+    return ${OCF_SUCCESS}
+}
+
+
+scst_notify() {
+    # We're currently not using this
+    ocf_log debug "scst_notify() -> Received a" \
+        "'${OCF_RESKEY_CRM_meta_notify_type}' /" \
+        "'${OCF_RESKEY_CRM_meta_notify_operation}' notification."
+
+    return ${OCF_SUCCESS}
+}
+
+
+check_alua() {
+    # Make sure the directories exist in the SCST sysfs structure
+    if [ ! -d "${SCST_SYSFS}/device_groups/${OCF_RESKEY_device_group}" ]; then
+        error_msg="The '${OCF_RESKEY_device_group}' device group does not exist!"
+         ocf_exit_reason "${error_msg}"
+        exit ${OCF_ERR_INSTALLED}
+    fi
+    target_groups="${SCST_SYSFS}/device_groups/${OCF_RESKEY_device_group}/target_groups"
+    if [ ! -d "${target_groups}/${OCF_RESKEY_local_tgt_grp}" ]; then
+        error_msg="The '${OCF_RESKEY_local_tgt_grp}' target group does not exist! "
+        ocf_exit_reason "${error_msg}"
+        exit ${OCF_ERR_INSTALLED}
+    fi
+    if [ ! -d "${target_groups}/${OCF_RESKEY_remote_tgt_grp}" ]; then
+        error_msg="The '${OCF_RESKEY_remote_tgt_grp}' target group does not exist!"
+        ocf_exit_reason "${error_msg}"
+        exit ${OCF_ERR_INSTALLED}
+    fi
+
+    # Check that the given ALUA states are valid
+    local valid_m_alua_state=0
+    local valid_s_alua_state=0
+    for i in ${ALUA_STATES}; do
+        if [ "x${OCF_RESKEY_m_alua_state}" = "x${i}" ]; then
+            valid_m_alua_state=1
+        fi
+        if [ "x${OCF_RESKEY_s_alua_state}" = "x${i}" ]; then
+            valid_s_alua_state=1
+        fi
+    done
+    if [ ${valid_m_alua_state} -eq 0 ]; then
+        error_msg="The 'm_alua_state' value is not valid: ${OCF_RESKEY_m_alua_state}"
+         ocf_exit_reason "${error_msg}"
+        exit ${OCF_ERR_INSTALLED}
+    fi
+    if [ ${valid_s_alua_state} -eq 0 ]; then
+        error_msg="The 's_alua_state' value is not valid: ${OCF_RESKEY_s_alua_state}"
+         ocf_exit_reason "${error_msg}"
+        exit ${OCF_ERR_INSTALLED}
+    fi
+}
+
+
+# Make sure meta-data and usage always succeed
+case ${__OCF_ACTION} in
+meta-data)
+    scst_meta_data
+    exit ${OCF_SUCCESS}
+    ;;
+usage|help)
+    scst_usage
+    exit ${OCF_SUCCESS}
+    ;;
+esac
+
+# Anything other than meta-data and usage must pass validation
+scst_validate_all || exit ${?}
+
+# Translate each action into the appropriate function call
+case ${__OCF_ACTION} in
+start)
+    scst_start
+    ;;
+stop)
+    scst_stop
+    ;;
+status|monitor)
+    scst_monitor
+    ;;
+notify)
+    scst_notify
+    ;;
+promote)
+    scst_promote
+    ;;
+demote)
+    scst_demote
+    ;;
+reload)
+    ocf_log info "Reloading..."
+    scst_start
+    ;;
+validate-all)
+    ;;
+migrate_to|migrate_from)
+    scst_usage
+    exit ${OCF_ERR_UNIMPLEMENTED}
+    ;;
+*)
+    scst_usage
+    exit ${OCF_ERR_UNIMPLEMENTED}
+    ;;
+esac
+
+# Log a debug message and exit
+rc=${?}
+ocf_log debug "${OCF_RESOURCE_INSTANCE} ${__OCF_ACTION} returned: ${rc}"
+exit ${rc}
