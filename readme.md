@@ -6,11 +6,11 @@ Thanks to `ALUA` (Asymetric Logical Unit Access) the back-end iSCSI storage can 
 
 Core components are
 
-Drbd Distributed Replicated Block Device
-LVM2 Linux Logical Volume Manager V2
-LVM Locking daemon
-DLM Distributed Lock Manager control daemon
-SCST The generic SCSI target subsystem for Linux
+- Drbd Distributed Replicated Block Device
+- LVM2 Linux Logical Volume Manager V2
+- LVM Locking daemon
+- DLM Distributed Lock Manager control daemon
+- SCST The generic SCSI target subsystem for Linux
 
 
 
