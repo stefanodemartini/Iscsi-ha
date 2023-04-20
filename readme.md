@@ -19,6 +19,10 @@ Core components are:
 
 
 
+##### Configure time zone
+
+`timedatectl set-timezone Europe/Rome`
+
 ##### Configure networking 
 
 `sudo rm /etc/netplan/00-installer-config.yaml`
